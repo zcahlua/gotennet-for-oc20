@@ -1,0 +1,41 @@
+seed: 7
+device: cpu
+
+dataset:
+  train_path: data/oc20/train.pt
+  val_path: data/oc20/val.pt
+  batch_size: 2
+
+model:
+  direct_forces: false
+  graph:
+    cutoff: 6.0
+    max_neighbors: 50
+  representation:
+    n_atom_basis: 128
+    n_interactions: 4
+    n_rbf: 32
+    radial_basis: expnorm
+    activation: swish
+    max_z: 100
+    num_heads: 8
+    attn_dropout: 0.0
+    edge_updates: false
+    lmax: 2
+    aggr: add
+    scale_edge: false
+
+optimizer:
+  lr: 2.0e-4
+  weight_decay: 0.0
+
+loss:
+  energy_weight: 0.1
+  force_weight: 1.0
+
+metrics:
+  - energy_mae
+  - force_mae
+
+trainer:
+  max_epochs: 1

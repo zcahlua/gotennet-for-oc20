@@ -73,8 +73,8 @@ docs = [
 "Bug Tracker" = "https://github.com/sarpaykent/gotennet/issues"
 
 [project.scripts]
-train_gotennet = "gotennet.scripts.train:main"
-test_gotennet = "gotennet.scripts.test:main"
+train_gotennet = "gotennet.oc20_runner:main"
+validate_gotennet = "gotennet.oc20_runner:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gotennet"]

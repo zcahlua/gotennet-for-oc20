@@ -1,20 +1,10 @@
---find-links https://download.pytorch.org/whl/cu124
-torch==2.5.1
-torchvision==0.20.1
-torchaudio==2.5.1
+# Install the PyTorch/PyG native stack with scripts/fix_pyg_env.sh first so the
+# extension wheels match your local torch and CUDA build. This file intentionally
+# avoids pinning stale torch-scatter / torch-sparse / torch-cluster wheels.
 
 torch_geometric
-
---find-links https://data.pyg.org/whl/torch-2.5.0+cu124.html
-pyg_lib
-torch_scatter
-torch_sparse
-torch_cluster
-torch_spline_conv
-
 lightning==2.2.5
 pytorch_lightning==2.2.5
-
 hydra-core
 python-dotenv
 pyrootutils
@@ -26,5 +16,6 @@ ase
 scikit-learn
 pandas
 rdkit
-
+omegaconf
+PyYAML
 e3nn

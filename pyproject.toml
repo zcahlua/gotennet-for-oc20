@@ -32,6 +32,7 @@ dependencies = [
   "torch_cluster",
   "e3nn",
   "ase",
+  "PyYAML",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +40,6 @@ dependencies = [
 full = [
   "torchvision",
   "torchaudio",
-  "pyg_lib",
   "torch_spline_conv",
   "lightning==2.2.5",
   "pytorch_lightning==2.2.5",

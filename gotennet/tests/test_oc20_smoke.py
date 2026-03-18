@@ -1,12 +1,13 @@
 import tempfile
 
+import pytest
 import torch
 import yaml
 from torch_geometric.data import Batch, Data
 
 from gotennet.models.oc20_model import OC20GotenNetS2EF
 from gotennet.models.pbc import build_pbc_graph
-from gotennet.oc20_runner import run
+from gotennet.oc20_runner import OC20DatasetFileNotFoundError, run
 
 
 def _sample_data(shift=None):
@@ -123,3 +124,16 @@ def test_launcher_config_load_smoke():
 
         run("train", cfg)
         run("validate", cfg)
+
+
+def test_missing_dataset_error_is_actionable():
+    cfg = _cfg("/tmp/does-not-exist")
+    cfg["_meta"] = {"config_path": "configs/oc20/s2ef/gotennet.yaml"}
+
+    with pytest.raises(OC20DatasetFileNotFoundError) as excinfo:
+        run("train", cfg)
+
+    message = str(excinfo.value)
+    assert "dataset.train_path" in message
+    assert "--train-path" in message
+    assert "OC20_TRAIN_PT" in message

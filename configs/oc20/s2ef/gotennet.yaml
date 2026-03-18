@@ -1,7 +1,12 @@
 seed: 7
-device: cpu
+device: auto
 
 dataset:
+  # Override with:
+  #   python main.py --config configs/oc20/s2ef/gotennet.yaml --mode train --train-path /abs/path/to/train.pt --val-path /abs/path/to/val.pt
+  # or:
+  #   export OC20_TRAIN_PT=/abs/path/to/train.pt
+  #   export OC20_VAL_PT=/abs/path/to/val.pt
   train_path: data/oc20/train.pt
   val_path: data/oc20/val.pt
   batch_size: 2

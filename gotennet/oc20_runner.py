@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
+import pickle
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Sequence
 
 import torch
 import yaml
+from torch.utils.data import DataLoader, Dataset
 from torch_geometric.data import Batch, Data
 
 from gotennet.models.oc20_model import OC20GotenNetS2EF
 
 DEFAULT_CONFIG_PATH = "configs/oc20/s2ef/gotennet.yaml"
-REQUIRED_SAMPLE_KEYS = ("atomic_numbers", "pos", "cell", "pbc")
+PT_REQUIRED_SAMPLE_KEYS = ("atomic_numbers", "pos", "cell", "pbc")
+LMDB_ENV_CANDIDATE_NAMES = ("data.lmdb",)
 
 
 class OC20DatasetConfigurationError(RuntimeError):
@@ -24,6 +28,102 @@ class OC20DatasetFileNotFoundError(FileNotFoundError):
     """Raised when an OC20 dataset tensor file is missing."""
 
 
+class OC20DatasetDependencyError(ImportError):
+    """Raised when an optional OC20 dataset dependency is unavailable."""
+
+
+class OC20DatasetFormatError(RuntimeError):
+    """Raised when dataset contents cannot be parsed into OC20 samples."""
+
+
+class PTListDataset(Dataset[Data]):
+    def __init__(self, samples: Sequence[Data]):
+        self.samples = list(samples)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> Data:
+        return self.samples[index]
+
+
+class LMDBDataset(Dataset[Data]):
+    def __init__(self, env_paths: Sequence[Path]):
+        try:
+            import lmdb  # type: ignore
+        except ImportError as exc:  # pragma: no cover - exercised in integration environments
+            raise OC20DatasetDependencyError(
+                "LMDB dataset support requires the optional 'lmdb' Python package. "
+                "Install it with `pip install lmdb` or `pip install -e .[full]` after updating dependencies."
+            ) from exc
+
+        self._lmdb = lmdb
+        self._env_paths = list(env_paths)
+        self._envs = []
+        self._keys: List[tuple[int, bytes]] = []
+
+        for env_index, env_path in enumerate(self._env_paths):
+            env = lmdb.open(
+                str(env_path),
+                subdir=env_path.is_dir(),
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_readers=1,
+            )
+            self._envs.append(env)
+            for key in self._enumerate_env_keys(env, env_path):
+                self._keys.append((env_index, key))
+
+        if not self._keys:
+            raise OC20DatasetConfigurationError(
+                "Resolved LMDB dataset path(s), but no sample entries were found. "
+                "Expected numbered keys such as '0', '1', ... inside the LMDB environment(s)."
+            )
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __getitem__(self, index: int) -> Data:
+        env_index, key = self._keys[index]
+        env = self._envs[env_index]
+        with env.begin(write=False) as txn:
+            value = txn.get(key)
+        if value is None:
+            raise OC20DatasetFormatError(
+                f"LMDB key {key!r} disappeared while reading from {self._env_paths[env_index]}."
+            )
+        raw = _deserialize_lmdb_value(value, env_path=self._env_paths[env_index], key=key)
+        return _sample_to_data(raw, source=f"{self._env_paths[env_index]}::{key.decode(errors='replace')}")
+
+    @staticmethod
+    def _enumerate_env_keys(env: Any, env_path: Path) -> List[bytes]:
+        keys: List[bytes] = []
+        with env.begin(write=False) as txn:
+            length = txn.get(b"length")
+            if length is not None:
+                try:
+                    num_entries = int(length.decode("utf-8"))
+                except ValueError as exc:
+                    raise OC20DatasetFormatError(
+                        f"LMDB metadata key 'length' in {env_path} is not an integer: {length!r}."
+                    ) from exc
+                keys.extend(str(idx).encode("ascii") for idx in range(num_entries))
+                return keys
+
+            cursor = txn.cursor()
+            for key, _ in cursor:
+                if key in {b"length", b"metadata", b"__keys__"}:
+                    continue
+                if key.isdigit():
+                    keys.append(bytes(key))
+
+        if keys:
+            keys.sort(key=lambda item: int(item.decode("ascii")))
+        return keys
+
+
 def _torch_load_data(path: str) -> Any:
     load_kwargs = {"map_location": "cpu"}
     try:
@@ -32,17 +132,37 @@ def _torch_load_data(path: str) -> Any:
         return torch.load(path, **load_kwargs)
 
 
+def _torch_load_bytes(blob: bytes) -> Any:
+    buffer = io.BytesIO(blob)
+    load_kwargs = {"map_location": "cpu"}
+    try:
+        return torch.load(buffer, weights_only=False, **load_kwargs)
+    except TypeError:
+        buffer.seek(0)
+        return torch.load(buffer, **load_kwargs)
+
+
 def _config_path_hint(cfg: Dict[str, Any]) -> str:
     config_path = cfg.get("_meta", {}).get("config_path")
     return str(config_path) if config_path else DEFAULT_CONFIG_PATH
 
 
-def _dataset_override_hint(config_path: str) -> str:
+def _dataset_override_hint(config_path: str, dataset_format: str) -> str:
+    format_help = (
+        "Use train.pt / val.pt Python-list tensors."
+        if dataset_format == "pt"
+        else "Use an LMDB file or a directory containing one or more LMDB environments (*.lmdb or data.mdb/lock.mdb)."
+    )
+    train_env = "OC20_TRAIN_PT" if dataset_format == "pt" else "OC20_TRAIN_LMDB"
+    val_env = "OC20_VAL_PT" if dataset_format == "pt" else "OC20_VAL_LMDB"
     return textwrap.dedent(
         f"""
+        Expected dataset.format: {dataset_format}
+        Format notes: {format_help}
+
         Override the dataset paths with either:
-          - CLI flags: python main.py --config {config_path} --mode train --train-path /abs/path/to/train.pt --val-path /abs/path/to/val.pt
-          - Environment variables: export OC20_TRAIN_PT=/abs/path/to/train.pt && export OC20_VAL_PT=/abs/path/to/val.pt
+          - CLI flags: python main.py --config {config_path} --mode train --dataset-format {dataset_format} --train-path /abs/path/to/train --val-path /abs/path/to/val
+          - Environment variables: export {train_env}=/abs/path/to/train && export {val_env}=/abs/path/to/val
           - Direct YAML edits in {config_path}
         """
     ).strip()
@@ -54,32 +174,72 @@ def _build_missing_path_message(
     split_name: str,
     config_key: str,
     cfg: Dict[str, Any],
+    dataset_format: str,
 ) -> str:
     config_path = _config_path_hint(cfg)
+    if dataset_format == "pt":
+        format_message = textwrap.dedent(
+            """
+            This repository does not ship OC20 `.pt` dataset tensors. The `.pt` mode is a
+            repo-specific convenience format that expects a Python list of sample dicts.
+            Each sample must provide at least: atomic_numbers, pos, cell, and pbc.
+            """
+        ).strip()
+    else:
+        format_message = textwrap.dedent(
+            """
+            Standard OC20 / FairChem S2EF training data is stored as LMDB. Point this path at
+            either a single LMDB file, an LMDB directory, or a directory containing one or more
+            LMDB shards. Typical layouts include paths like `train/data.lmdb`, `val_id/data.lmdb`,
+            or a split directory that contains multiple `*.lmdb` shards.
+            """
+        ).strip()
+
     return textwrap.dedent(
         f"""
-        Missing OC20 {split_name} dataset file: {missing_path}
+        Missing OC20 {split_name} dataset path: {missing_path}
         Config key: dataset.{config_key}
         Config file: {config_path}
 
-        This repository does not ship OC20 `.pt` dataset tensors. The OC20 runner expects
-        preconverted `train.pt` / `val.pt` files containing a Python list of sample dicts.
-        Each sample must provide at least: atomic_numbers, pos, cell, and pbc.
+        {format_message}
 
-        {_dataset_override_hint(config_path)}
+        {_dataset_override_hint(config_path, dataset_format)}
+        """
+    ).strip()
 
-        This fork currently does not include an OC20 LMDB-to-`.pt` conversion script, so if
-        you only have the original OC20 data you need to generate these `.pt` files with your
-        existing preprocessing pipeline before launching training.
+
+def _build_invalid_path_message(
+    *,
+    invalid_path: str,
+    split_name: str,
+    config_key: str,
+    cfg: Dict[str, Any],
+    dataset_format: str,
+) -> str:
+    config_path = _config_path_hint(cfg)
+    expectation = (
+        "Expected a `.pt` file containing a Python list of sample dictionaries."
+        if dataset_format == "pt"
+        else "Expected an LMDB file, an LMDB directory, or a directory that contains one or more LMDB environments."
+    )
+    return textwrap.dedent(
+        f"""
+        Invalid OC20 {split_name} dataset path: {invalid_path}
+        Config key: dataset.{config_key}
+        Config file: {config_path}
+
+        {expectation}
+
+        {_dataset_override_hint(config_path, dataset_format)}
         """
     ).strip()
 
 
 def _resolve_device(device_name: str | None) -> torch.device:
-    requested = (device_name or "auto").strip().lower()
+    requested = (device_name or os.environ.get("OC20_DEVICE") or "auto").strip().lower()
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_name)
+    return torch.device(requested)
 
 
 def _coerce_tensor(value: Any, *, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -89,11 +249,19 @@ def _coerce_tensor(value: Any, *, dtype: torch.dtype | None = None) -> torch.Ten
     return tensor
 
 
-def _resolve_dataset_paths(cfg: Dict[str, Any]) -> Dict[str, str]:
+def _resolve_dataset_paths(cfg: Dict[str, Any]) -> Dict[str, Any]:
     dataset_cfg = cfg.setdefault("dataset", {})
+    dataset_format = str(dataset_cfg.get("format", os.environ.get("OC20_DATASET_FORMAT") or "pt")).lower()
+    if dataset_format not in {"pt", "lmdb"}:
+        raise OC20DatasetConfigurationError(
+            f"Unsupported dataset.format={dataset_format!r}. Expected 'pt' or 'lmdb'."
+        )
+
+    env_prefix = "PT" if dataset_format == "pt" else "LMDB"
     resolved_paths = {
-        "train_path": os.environ.get("OC20_TRAIN_PT") or dataset_cfg.get("train_path"),
-        "val_path": os.environ.get("OC20_VAL_PT") or dataset_cfg.get("val_path"),
+        "format": dataset_format,
+        "train_path": os.environ.get(f"OC20_TRAIN_{env_prefix}") or dataset_cfg.get("train_path"),
+        "val_path": os.environ.get(f"OC20_VAL_{env_prefix}") or dataset_cfg.get("val_path"),
     }
     dataset_cfg.update(resolved_paths)
     return resolved_paths
@@ -105,7 +273,8 @@ def _validate_dataset_path(
     config_key: str,
     split_name: str,
     path_value: str | None,
-) -> str:
+    dataset_format: str,
+) -> Path:
     if not path_value:
         raise OC20DatasetConfigurationError(
             _build_missing_path_message(
@@ -113,6 +282,7 @@ def _validate_dataset_path(
                 split_name=split_name,
                 config_key=config_key,
                 cfg=cfg,
+                dataset_format=dataset_format,
             )
         )
 
@@ -127,60 +297,200 @@ def _validate_dataset_path(
                 split_name=split_name,
                 config_key=config_key,
                 cfg=cfg,
+                dataset_format=dataset_format,
             )
         )
-    return str(path)
+    return path
 
 
-def _read_samples(path: str, *, split_name: str, config_key: str, cfg: Dict[str, Any]) -> List[Data]:
-    dataset_path = _validate_dataset_path(
-        cfg=cfg,
-        config_key=config_key,
-        split_name=split_name,
-        path_value=path,
+def _discover_lmdb_env_paths(path: Path, *, cfg: Dict[str, Any], split_name: str, config_key: str) -> List[Path]:
+    if path.is_file():
+        if path.suffix != ".lmdb":
+            raise OC20DatasetConfigurationError(
+                _build_invalid_path_message(
+                    invalid_path=str(path),
+                    split_name=split_name,
+                    config_key=config_key,
+                    cfg=cfg,
+                    dataset_format="lmdb",
+                )
+            )
+        return [path]
+
+    if path.is_dir() and (path / "data.mdb").exists():
+        return [path]
+
+    matches: List[Path] = []
+    if path.is_dir():
+        for candidate in sorted(path.rglob("*.lmdb")):
+            matches.append(candidate)
+        for candidate_name in LMDB_ENV_CANDIDATE_NAMES:
+            for candidate in sorted(path.rglob(candidate_name)):
+                if candidate not in matches:
+                    matches.append(candidate)
+        for candidate in sorted(path.rglob("data.mdb")):
+            env_dir = candidate.parent
+            if env_dir not in matches:
+                matches.append(env_dir)
+
+    if matches:
+        return matches
+
+    raise OC20DatasetConfigurationError(
+        _build_invalid_path_message(
+            invalid_path=str(path),
+            split_name=split_name,
+            config_key=config_key,
+            cfg=cfg,
+            dataset_format="lmdb",
+        )
     )
-    raw = _torch_load_data(dataset_path)
+
+
+def _deserialize_lmdb_value(blob: bytes, *, env_path: Path, key: bytes) -> Any:
+    errors: List[str] = []
+    for loader_name, loader in (("pickle", pickle.loads), ("torch", _torch_load_bytes)):
+        try:
+            return loader(blob)
+        except Exception as exc:  # pragma: no cover - defensive branch
+            errors.append(f"{loader_name}: {exc}")
+    raise OC20DatasetFormatError(
+        f"Could not decode LMDB sample {key!r} from {env_path}. Tried pickle and torch deserialization. "
+        f"Errors: {'; '.join(errors)}"
+    )
+
+
+def _sample_to_data(sample: Any, *, source: str) -> Data:
+    if isinstance(sample, Data):
+        item = sample.to_dict()
+    elif isinstance(sample, dict):
+        item = sample
+    else:
+        raise OC20DatasetConfigurationError(
+            f"Sample from {source} is a {type(sample).__name__}, expected a dict or torch_geometric.data.Data."
+        )
+
+    if "pos" not in item:
+        raise OC20DatasetConfigurationError(f"Sample from {source} is missing required key: pos.")
+
+    pos = _coerce_tensor(item["pos"], dtype=torch.float)
+
+    atomic_numbers = item.get("atomic_numbers")
+    if atomic_numbers is None and "atomic_numbers" not in item:
+        atomic_numbers = item.get("z")
+    if atomic_numbers is None:
+        raise OC20DatasetConfigurationError(
+            f"Sample from {source} is missing required atomic numbers ('atomic_numbers' or 'z')."
+        )
+
+    cell = item.get("cell")
+    if cell is None:
+        raise OC20DatasetConfigurationError(f"Sample from {source} is missing required key: cell.")
+    cell_tensor = _coerce_tensor(cell, dtype=torch.float)
+    if cell_tensor.ndim == 3 and cell_tensor.size(0) == 1:
+        cell_tensor = cell_tensor[0]
+
+    pbc = item.get("pbc")
+    if pbc is None:
+        raise OC20DatasetConfigurationError(f"Sample from {source} is missing required key: pbc.")
+    pbc_tensor = _coerce_tensor(pbc, dtype=torch.bool)
+    if pbc_tensor.ndim == 2 and pbc_tensor.size(0) == 1:
+        pbc_tensor = pbc_tensor[0]
+
+    energy = item.get("energy")
+    if energy is None:
+        energy = item.get("y", torch.tensor(0.0))
+    energy_tensor = _coerce_tensor(energy, dtype=torch.float).view(1)
+
+    forces = item.get("forces")
+    if forces is None:
+        forces = item.get("force", torch.zeros_like(pos))
+    forces_tensor = _coerce_tensor(forces, dtype=torch.float)
+
+    fixed = item.get("fixed")
+    if fixed is None:
+        tags = item.get("tags")
+        if tags is not None:
+            fixed = _coerce_tensor(tags, dtype=torch.long) == 0
+        else:
+            fixed = torch.zeros(pos.size(0), dtype=torch.bool)
+    fixed_tensor = _coerce_tensor(fixed, dtype=torch.bool).view(-1)
+
+    natoms = item.get("natoms")
+    if natoms is None:
+        natoms = torch.tensor([pos.size(0)], dtype=torch.long)
+    natoms_tensor = _coerce_tensor(natoms, dtype=torch.long).view(1)
+
+    return Data(
+        atomic_numbers=_coerce_tensor(atomic_numbers, dtype=torch.long).view(-1),
+        pos=pos,
+        energy=energy_tensor,
+        forces=forces_tensor,
+        cell=cell_tensor,
+        pbc=pbc_tensor,
+        fixed=fixed_tensor,
+        natoms=natoms_tensor,
+    )
+
+
+def _read_pt_dataset(path: Path, *, split_name: str, config_key: str, cfg: Dict[str, Any]) -> PTListDataset:
+    raw = _torch_load_data(str(path))
     if not isinstance(raw, list):
         raise OC20DatasetConfigurationError(
-            f"Expected {dataset_path} to contain a Python list of sample dictionaries, got {type(raw).__name__}."
+            f"Expected {path} to contain a Python list of sample dictionaries, got {type(raw).__name__}."
         )
     if not raw:
-        raise OC20DatasetConfigurationError(f"Dataset file {dataset_path} is empty; expected at least one sample.")
+        raise OC20DatasetConfigurationError(f"Dataset file {path} is empty; expected at least one sample.")
 
     samples: List[Data] = []
     for sample_index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise OC20DatasetConfigurationError(
-                f"Sample {sample_index} in {dataset_path} is a {type(item).__name__}, expected a dict."
+                f"Sample {sample_index} in {path} is a {type(item).__name__}, expected a dict."
             )
-        missing_keys = [key for key in REQUIRED_SAMPLE_KEYS if key not in item]
+        missing_keys = [key for key in PT_REQUIRED_SAMPLE_KEYS if key not in item]
         if missing_keys:
             raise OC20DatasetConfigurationError(
-                f"Sample {sample_index} in {dataset_path} is missing required keys: {', '.join(missing_keys)}."
+                f"Sample {sample_index} in {path} is missing required keys: {', '.join(missing_keys)}."
             )
-
-        pos = _coerce_tensor(item["pos"], dtype=torch.float)
-        samples.append(
-            Data(
-                atomic_numbers=_coerce_tensor(item["atomic_numbers"], dtype=torch.long),
-                pos=pos,
-                energy=_coerce_tensor(item.get("energy", torch.tensor(0.0)), dtype=torch.float).view(1),
-                forces=_coerce_tensor(item.get("forces", torch.zeros_like(pos)), dtype=torch.float),
-                cell=_coerce_tensor(item["cell"], dtype=torch.float),
-                pbc=_coerce_tensor(item["pbc"], dtype=torch.bool),
-                fixed=_coerce_tensor(
-                    item.get("fixed", torch.zeros(pos.size(0), dtype=torch.bool)),
-                    dtype=torch.bool,
-                ),
-                natoms=torch.tensor([pos.size(0)], dtype=torch.long),
-            )
-        )
-    return samples
+        samples.append(_sample_to_data(item, source=f"{path}::{sample_index}"))
+    return PTListDataset(samples)
 
 
-def _iter_batches(samples: List[Data], batch_size: int):
-    for i in range(0, len(samples), batch_size):
-        yield Batch.from_data_list(samples[i : i + batch_size])
+def _read_lmdb_dataset(path: Path, *, split_name: str, config_key: str, cfg: Dict[str, Any]) -> LMDBDataset:
+    env_paths = _discover_lmdb_env_paths(path, cfg=cfg, split_name=split_name, config_key=config_key)
+    return LMDBDataset(env_paths)
+
+
+def _read_dataset(
+    path: str,
+    *,
+    split_name: str,
+    config_key: str,
+    cfg: Dict[str, Any],
+    dataset_format: str,
+) -> Dataset[Data]:
+    dataset_path = _validate_dataset_path(
+        cfg=cfg,
+        config_key=config_key,
+        split_name=split_name,
+        path_value=path,
+        dataset_format=dataset_format,
+    )
+
+    if dataset_format == "pt":
+        return _read_pt_dataset(dataset_path, split_name=split_name, config_key=config_key, cfg=cfg)
+    return _read_lmdb_dataset(dataset_path, split_name=split_name, config_key=config_key, cfg=cfg)
+
+
+def _iter_batches(dataset: Dataset[Data], batch_size: int, *, shuffle: bool) -> Iterable[Batch]:
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=Batch.from_data_list,
+    )
+    yield from dataloader
 
 
 def _masked_force_mae(pred: torch.Tensor, target: torch.Tensor, fixed: torch.Tensor) -> torch.Tensor:
@@ -199,24 +509,26 @@ def run(mode: str, cfg: Dict) -> None:
         direct_forces=cfg["model"].get("direct_forces", False),
     ).to(device)
 
-    train_samples = (
-        _read_samples(
+    train_dataset = (
+        _read_dataset(
             dataset_paths["train_path"],
             split_name="train",
             config_key="train_path",
             cfg=cfg,
+            dataset_format=dataset_paths["format"],
         )
         if mode == "train"
-        else []
+        else None
     )
-    val_samples = _read_samples(
+    val_dataset = _read_dataset(
         dataset_paths["val_path"],
         split_name="validation",
         config_key="val_path",
         cfg=cfg,
+        dataset_format=dataset_paths["format"],
     )
 
-    if mode == "train":
+    if mode == "train" and train_dataset is not None:
         optim = torch.optim.AdamW(
             model.parameters(),
             lr=cfg["optimizer"]["lr"],
@@ -226,7 +538,8 @@ def run(mode: str, cfg: Dict) -> None:
         epochs = cfg["trainer"]["max_epochs"]
         for epoch in range(epochs):
             model.train()
-            for batch in _iter_batches(train_samples, cfg["dataset"]["batch_size"]):
+            loss = None
+            for batch in _iter_batches(train_dataset, cfg["dataset"]["batch_size"], shuffle=True):
                 batch = batch.to(device)
                 out = model(batch)
                 e_loss = (out["energy"] - batch.energy.view(-1)).abs().mean()
@@ -235,17 +548,22 @@ def run(mode: str, cfg: Dict) -> None:
                 optim.zero_grad()
                 loss.backward()
                 optim.step()
+            if loss is None:
+                raise OC20DatasetConfigurationError("Training dataset is empty; expected at least one batch.")
             print(f"epoch={epoch+1}/{epochs} train_loss={float(loss):.6f}")
 
     model.eval()
     with torch.set_grad_enabled(True):
         mae_energy = []
         mae_force = []
-        for batch in _iter_batches(val_samples, cfg["dataset"]["batch_size"]):
+        for batch in _iter_batches(val_dataset, cfg["dataset"]["batch_size"], shuffle=False):
             batch = batch.to(device)
             out = model(batch)
             mae_energy.append((out["energy"] - batch.energy.view(-1)).abs().mean().detach())
             mae_force.append(_masked_force_mae(out["forces"], batch.forces, batch.fixed).detach())
+
+    if not mae_energy or not mae_force:
+        raise OC20DatasetConfigurationError("Validation dataset is empty; expected at least one batch.")
 
     print(
         f"validation_energy_mae={torch.stack(mae_energy).mean().item():.6f} "
@@ -257,6 +575,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="OC20 S2EF runner for GotenNet")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--mode", choices=["train", "validate"], default="train")
+    parser.add_argument("--dataset-format", choices=["pt", "lmdb"], help="Override dataset.format.")
     parser.add_argument("--train-path", help="Override dataset.train_path for the OC20 train split.")
     parser.add_argument("--val-path", help="Override dataset.val_path for the OC20 validation split.")
     parser.add_argument("--device", help="Override config device. Use 'auto', 'cuda', 'cuda:0', or 'cpu'.")
@@ -267,6 +586,8 @@ def main() -> None:
         cfg = yaml.safe_load(f)
 
     cfg.setdefault("_meta", {})["config_path"] = str(cfg_path)
+    if args.dataset_format:
+        cfg.setdefault("dataset", {})["format"] = args.dataset_format
     if args.train_path:
         cfg.setdefault("dataset", {})["train_path"] = args.train_path
     if args.val_path:

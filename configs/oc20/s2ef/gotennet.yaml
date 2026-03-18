@@ -2,13 +2,16 @@ seed: 7
 device: auto
 
 dataset:
+  format: lmdb
   # Override with:
-  #   python main.py --config configs/oc20/s2ef/gotennet.yaml --mode train --train-path /abs/path/to/train.pt --val-path /abs/path/to/val.pt
+  #   python main.py --config configs/oc20/s2ef/gotennet.yaml --mode train --dataset-format lmdb --train-path /abs/path/to/train --val-path /abs/path/to/val --device auto
   # or:
-  #   export OC20_TRAIN_PT=/abs/path/to/train.pt
-  #   export OC20_VAL_PT=/abs/path/to/val.pt
-  train_path: data/oc20/train.pt
-  val_path: data/oc20/val.pt
+  #   export OC20_TRAIN_LMDB=/abs/path/to/train
+  #   export OC20_VAL_LMDB=/abs/path/to/val
+  #   export OC20_DEVICE=auto
+  # Standard OC20/FairChem S2EF layouts typically point at LMDB files or shard directories.
+  train_path: data/oc20/s2ef/train
+  val_path: data/oc20/s2ef/val_id
   batch_size: 2
 
 model:

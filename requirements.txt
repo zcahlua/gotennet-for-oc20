@@ -19,3 +19,5 @@ rdkit
 omegaconf
 PyYAML
 e3nn
+
+lmdb

@@ -33,6 +33,7 @@ dependencies = [
   "e3nn",
   "ase",
   "PyYAML",
+  "lmdb",
 ]
 
 [project.optional-dependencies]

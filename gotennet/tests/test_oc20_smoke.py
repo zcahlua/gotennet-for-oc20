@@ -9,7 +9,7 @@ from torch_geometric.data import Batch, Data
 
 from gotennet.models.oc20_model import OC20GotenNetS2EF
 from gotennet.models.pbc import build_pbc_graph
-from gotennet.oc20_runner import OC20DatasetFileNotFoundError, run
+from gotennet.oc20_runner import OC20DatasetFileNotFoundError, create_dummy_oc20_lmdb, run
 
 try:
     import lmdb
@@ -183,18 +183,33 @@ def test_missing_pt_dataset_error_is_actionable():
     assert "repo-specific convenience format" in message
 
 
-def test_missing_lmdb_dataset_error_is_actionable():
+def test_missing_lmdb_dataset_is_auto_generated():
+    if lmdb is None:
+        pytest.skip("lmdb package is not installed in this environment")
     cfg = _cfg("/tmp/does-not-exist", dataset_format="lmdb")
     cfg["_meta"] = {"config_path": "configs/oc20/s2ef/gotennet.yaml"}
 
-    with pytest.raises(OC20DatasetFileNotFoundError) as excinfo:
-        run("train", cfg)
+    run("train", cfg)
+    assert Path(cfg["dataset"]["train_path"]).exists()
+    assert Path(cfg["dataset"]["val_path"]).exists()
 
-    message = str(excinfo.value)
-    assert "dataset.train_path" in message
-    assert "OC20_TRAIN_LMDB" in message
-    assert "LMDB" in message
-    assert "directory containing one or more" in message
+
+def test_create_dummy_oc20_lmdb_produces_expected_schema():
+    if lmdb is None:
+        pytest.skip("lmdb package is not installed in this environment")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir) / "dummy"
+        create_dummy_oc20_lmdb(str(out), num_samples=3)
+
+        env = lmdb.open(str(out), subdir=True, readonly=True, lock=False)
+        with env.begin(write=False) as txn:
+            assert txn.get(b"length") == b"3"
+            raw = txn.get(b"0")
+            assert raw is not None
+            sample = pickle.loads(raw)
+        env.close()
+
+        assert set(["z", "pos", "cell", "pbc", "y", "force", "fixed", "natoms"]).issubset(sample.keys())
 
 
 def test_lmdb_shard_directory_is_discovered():

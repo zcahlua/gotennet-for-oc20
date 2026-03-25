@@ -4,6 +4,7 @@ import argparse
 import io
 import os
 import pickle
+import shutil
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -18,6 +19,8 @@ from gotennet.models.oc20_model import OC20GotenNetS2EF
 DEFAULT_CONFIG_PATH = "configs/oc20/s2ef/gotennet.yaml"
 PT_REQUIRED_SAMPLE_KEYS = ("atomic_numbers", "pos", "cell", "pbc")
 LMDB_ENV_CANDIDATE_NAMES = ("data.lmdb",)
+DUMMY_LMDB_TRAIN_SAMPLES = 20
+DUMMY_LMDB_VAL_SAMPLES = 8
 
 
 class OC20DatasetConfigurationError(RuntimeError):
@@ -34,6 +37,68 @@ class OC20DatasetDependencyError(ImportError):
 
 class OC20DatasetFormatError(RuntimeError):
     """Raised when dataset contents cannot be parsed into OC20 samples."""
+
+
+def create_dummy_oc20_lmdb(path: str, num_samples: int = 20) -> None:
+    """Create a tiny OC20-style LMDB dataset for smoke runs and local debugging."""
+    try:
+        import lmdb  # type: ignore
+    except ImportError as exc:  # pragma: no cover - exercised in integration environments
+        raise OC20DatasetDependencyError(
+            "Cannot auto-generate dummy OC20 LMDB dataset because 'lmdb' is not installed. "
+            "Install it with `pip install lmdb`."
+        ) from exc
+
+    dataset_path = Path(path).expanduser()
+    if not dataset_path.is_absolute():
+        dataset_path = Path.cwd() / dataset_path
+    dataset_path = dataset_path.resolve()
+
+    if dataset_path.suffix == ".lmdb":
+        env_path = dataset_path
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        subdir = False
+    else:
+        env_path = dataset_path
+        if env_path.exists() and env_path.is_file():
+            env_path.unlink()
+        env_path.mkdir(parents=True, exist_ok=True)
+        subdir = True
+
+    if env_path.exists() and env_path.is_dir() and (env_path / "data.mdb").exists():
+        shutil.rmtree(env_path)
+        env_path.mkdir(parents=True, exist_ok=True)
+    if env_path.exists() and env_path.is_file():
+        env_path.unlink()
+
+    map_size = 1 << 24
+    env = lmdb.open(str(env_path), map_size=map_size, subdir=subdir)
+    with env.begin(write=True) as txn:
+        txn.put(b"length", str(num_samples).encode("utf-8"))
+        base_cell = torch.eye(3, dtype=torch.float) * 6.0
+        base_z = torch.tensor([8, 1, 1], dtype=torch.long)
+        base_force = torch.zeros(3, 3, dtype=torch.float)
+        base_fixed = torch.tensor([False, False, False], dtype=torch.bool)
+        base_pbc = torch.tensor([True, True, False], dtype=torch.bool)
+        for idx in range(num_samples):
+            offset = float(idx) * 0.01
+            pos = torch.tensor(
+                [[0.0 + offset, 0.0, 0.0], [1.4 + offset, 0.0, 0.0], [0.0 + offset, 1.4, 0.0]],
+                dtype=torch.float,
+            )
+            item = {
+                "z": base_z.clone(),
+                "pos": pos,
+                "cell": base_cell.clone(),
+                "pbc": base_pbc.clone(),
+                "y": torch.tensor([0.0], dtype=torch.float),
+                "force": base_force.clone(),
+                "fixed": base_fixed.clone(),
+                "natoms": torch.tensor([3], dtype=torch.long),
+            }
+            txn.put(str(idx).encode("ascii"), pickle.dumps(item))
+    env.sync()
+    env.close()
 
 
 class PTListDataset(Dataset[Data]):
@@ -276,30 +341,37 @@ def _validate_dataset_path(
     dataset_format: str,
 ) -> Path:
     if not path_value:
-        raise OC20DatasetConfigurationError(
-            _build_missing_path_message(
-                missing_path="<unset>",
-                split_name=split_name,
-                config_key=config_key,
-                cfg=cfg,
-                dataset_format=dataset_format,
+        if dataset_format != "lmdb":
+            raise OC20DatasetConfigurationError(
+                _build_missing_path_message(
+                    missing_path="<unset>",
+                    split_name=split_name,
+                    config_key=config_key,
+                    cfg=cfg,
+                    dataset_format=dataset_format,
+                )
             )
-        )
+        path_value = f"data/oc20/dummy/{config_key}"
 
     path = Path(path_value).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
     path = path.resolve()
     if not path.exists():
-        raise OC20DatasetFileNotFoundError(
-            _build_missing_path_message(
-                missing_path=str(path),
-                split_name=split_name,
-                config_key=config_key,
-                cfg=cfg,
-                dataset_format=dataset_format,
+        if dataset_format != "lmdb":
+            raise OC20DatasetFileNotFoundError(
+                _build_missing_path_message(
+                    missing_path=str(path),
+                    split_name=split_name,
+                    config_key=config_key,
+                    cfg=cfg,
+                    dataset_format=dataset_format,
+                )
             )
-        )
+
+        sample_count = DUMMY_LMDB_TRAIN_SAMPLES if split_name == "train" else DUMMY_LMDB_VAL_SAMPLES
+        create_dummy_oc20_lmdb(str(path), num_samples=sample_count)
+        print(f"[oc20_runner] Created dummy LMDB dataset for {split_name} split at: {path}")
     return path
 
 

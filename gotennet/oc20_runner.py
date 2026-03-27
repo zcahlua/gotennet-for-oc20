@@ -461,12 +461,18 @@ def _sample_to_data(sample: Any, *, source: str) -> Data:
     cell_tensor = _coerce_tensor(cell, dtype=torch.float)
     if cell_tensor.ndim == 3 and cell_tensor.size(0) == 1:
         cell_tensor = cell_tensor[0]
+    # Ensure cell is [3, 3] - per-graph property
+    cell_tensor = cell_tensor.view(3, 3)
 
     pbc = item.get("pbc")
     if pbc is None:
         raise OC20DatasetConfigurationError(f"Sample from {source} is missing required key: pbc.")
     pbc_tensor = _coerce_tensor(pbc, dtype=torch.bool)
+    # Ensure pbc is always [3] shape (per-graph property, not per-node)
     if pbc_tensor.ndim == 2 and pbc_tensor.size(0) == 1:
+        pbc_tensor = pbc_tensor[0]
+    elif pbc_tensor.ndim == 2 and pbc_tensor.size(1) == 3:
+        # If somehow we got [N, 3], take the first row as all should be same per graph
         pbc_tensor = pbc_tensor[0]
 
     energy = item.get("energy")
@@ -493,16 +499,17 @@ def _sample_to_data(sample: Any, *, source: str) -> Data:
         natoms = torch.tensor([pos.size(0)], dtype=torch.long)
     natoms_tensor = _coerce_tensor(natoms, dtype=torch.long).view(1)
 
-    return Data(
+    data = Data(
         atomic_numbers=_coerce_tensor(atomic_numbers, dtype=torch.long).view(-1),
         pos=pos,
         energy=energy_tensor,
         forces=forces_tensor,
-        cell=cell_tensor,
-        pbc=pbc_tensor,
+        cell=cell_tensor.view(1, 3, 3),  # [1, 3, 3] to prevent PyG from flattening during batching
+        pbc=pbc_tensor.view(1, 3),  # [1, 3] to prevent PyG from flattening during batching
         fixed=fixed_tensor,
         natoms=natoms_tensor,
     )
+    return data
 
 
 def _read_pt_dataset(path: Path, *, split_name: str, config_key: str, cfg: Dict[str, Any]) -> PTListDataset:

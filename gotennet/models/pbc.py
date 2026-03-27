@@ -7,19 +7,57 @@ import torch
 
 
 def _as_batch_cell(cell: torch.Tensor, num_graphs: int) -> torch.Tensor:
+    """Convert cell to [num_graphs, 3, 3] shape.
+    
+    cell can be:
+    - [3, 3]: single graph, expand to [num_graphs, 3, 3]
+    - [1, 3, 3]: single graph with batch dim, expand to [num_graphs, 3, 3]
+    - [num_graphs, 3, 3]: already correct shape
+    - [num_graphs * 1, 3, 3]: batched [1, 3, 3] from PyG batching
+    """
     if cell.dim() == 2:
+        # [3, 3] -> [num_graphs, 3, 3]
         return cell.unsqueeze(0).expand(num_graphs, -1, -1)
     if cell.dim() == 3:
-        return cell
-    raise ValueError(f"Expected cell shape [3, 3] or [B, 3, 3], got {tuple(cell.shape)}")
+        if cell.size(0) == num_graphs:
+            # [num_graphs, 3, 3] - already correct
+            return cell
+        elif cell.size(0) == 1:
+            # [1, 3, 3] - single graph, expand
+            return cell.expand(num_graphs, -1, -1)
+        elif cell.size(0) == num_graphs * 1:
+            # [num_graphs, 3, 3] from batched [1, 3, 3] - reshape
+            return cell.view(num_graphs, 3, 3)
+        else:
+            raise ValueError(f"Cannot reshape cell from {tuple(cell.shape)} to [{num_graphs}, 3, 3]")
+    raise ValueError(f"Expected cell shape [3, 3], [1, 3, 3], or [B, 3, 3], got {tuple(cell.shape)}")
 
 
 def _as_batch_pbc(pbc: torch.Tensor, num_graphs: int) -> torch.Tensor:
+    """Convert pbc to [num_graphs, 3] shape.
+    
+    pbc can be:
+    - [3]: single graph, expand to [num_graphs, 3]
+    - [1, 3]: single graph with batch dim, expand to [num_graphs, 3]
+    - [num_graphs, 3]: already correct shape
+    - [num_graphs * 1, 3]: batched [1, 3] from PyG batching
+    """
     if pbc.dim() == 1:
+        # [3] -> [num_graphs, 3]
         return pbc.unsqueeze(0).expand(num_graphs, -1)
     if pbc.dim() == 2:
-        return pbc
-    raise ValueError(f"Expected pbc shape [3] or [B, 3], got {tuple(pbc.shape)}")
+        if pbc.size(0) == num_graphs:
+            # [num_graphs, 3] - already correct
+            return pbc
+        elif pbc.size(0) == 1:
+            # [1, 3] - single graph, expand
+            return pbc.expand(num_graphs, -1)
+        elif pbc.size(0) == num_graphs * 1:
+            # [num_graphs, 3] from batched [1, 3] - reshape
+            return pbc.view(num_graphs, 3)
+        else:
+            raise ValueError(f"Cannot reshape pbc from {tuple(pbc.shape)} to [{num_graphs}, 3]")
+    raise ValueError(f"Expected pbc shape [3], [1, 3], or [B, 3], got {tuple(pbc.shape)}")
 
 
 def build_pbc_graph(

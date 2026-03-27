@@ -46,4 +46,4 @@ metrics:
   - force_mae
 
 trainer:
-  max_epochs: 1
+  max_epochs: 300
